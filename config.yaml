@@ -20,9 +20,19 @@ lora:
   decay_factor: 0.1
 
 thresholds:
+  soft_ctx_tokens: 4096
+  hard_max_ctx_tokens: 8192
   max_ctx_tokens: 8192
   evict_chunk_tokens: 2048
   keep_recent_tokens: 2048
+  max_keep_recent_tokens: 4096
+
+advisor:
+  default_expected_turns: 10
+  rework_token_penalty: 512
+  rework_max_tokens: 4096
+  min_break_even_savings: 0.0001
+  default_t_comp_sec: 0.85
 
 strix_halo:
   no_mmap: true

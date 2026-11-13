@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from session_store import SessionStore
 from consolidator import EphemeralConsolidator, ConsolidationItem
+from advisor import ConsolidationAdvisor, AdvisorDecision
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("proxy")
@@ -96,7 +97,7 @@ async def _delayed_set_idle(grace_ms: int):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global config, session_store, consolidator
+    global config, session_store, consolidator, advisor
     config = load_config()
     inference_idle_event.set()  # Initial state is idle
 
@@ -113,9 +114,10 @@ async def lifespan(app: FastAPI):
         logger.info(f"[Strix Halo GTT Check] GTT Total: {gtt_info['gtt_total_gb']} GB (Verified >= {min_expected_gb} GB)")
 
     session_store = SessionStore(config.get("database", {}).get("path", "/home/loki/ephemeral-lora-proxy/sessions.db"))
-    consolidator = EphemeralConsolidator(config, session_store, inference_idle_event)
+    advisor = ConsolidationAdvisor(config)
+    consolidator = EphemeralConsolidator(config, session_store, inference_idle_event, advisor=advisor)
     consolidator.start()
-    logger.info("Ephemeral LoRA Proxy initialized successfully")
+    logger.info("Ephemeral LoRA Proxy initialized successfully with ConsolidationAdvisor")
 
     yield
 
@@ -137,6 +139,23 @@ async def health():
         "consolidation_queue_depth": q_depth,
         "gtt_memory": gtt,
         "backend": config.get("backend", "llamacpp_native"),
+        "advisor": advisor.get_metrics("default") if advisor else {},
+    }
+
+
+@app.get("/v1/sessions/{session_id}/advisor")
+async def get_session_advisor(session_id: str):
+    """Exposes the ConsolidationAdvisor live decision metrics and break-even calculations."""
+    upstream_host = config.get("upstream", {}).get("host", "127.0.0.1")
+    upstream_port = config.get("upstream", {}).get("port", 8081)
+    upstream_url = f"http://{upstream_host}:{upstream_port}"
+    active_msgs = session_store.get_active_messages(session_id)
+    ctx_tokens = await _tokenize_messages(active_msgs, upstream_url) if active_msgs else 0
+    decision = advisor.evaluate_turn(session_id, ctx_tokens)
+    return {
+        "session_id": session_id,
+        "decision": decision.to_dict(),
+        "metrics": advisor.get_metrics(session_id),
     }
 
 
@@ -159,9 +178,16 @@ def _sync_client_messages(session_id: str, incoming_messages: List[Dict[str, Any
     """
     Deduplicates incoming client messages against stored session history.
     OpenAI-compatible clients send the entire conversation history on every turn.
-    We identify the common prefix match length and insert only net-new turns.
+    We identify already-recorded messages and insert only net-new turns.
     """
     existing_msgs = session_store.get_all_messages(session_id)
+    if not existing_msgs:
+        for m in incoming_messages:
+            msg_id = session_store.add_message(session_id, m.get("role", "user"), m.get("content", ""))
+            existing_msgs.append({"id": msg_id, "role": m.get("role"), "content": m.get("content")})
+        return
+
+    # Check if incoming matches existing from the beginning
     prefix_len = 0
     while prefix_len < len(incoming_messages) and prefix_len < len(existing_msgs):
         inc = incoming_messages[prefix_len]
@@ -171,11 +197,25 @@ def _sync_client_messages(session_id: str, incoming_messages: List[Dict[str, Any
         else:
             break
 
-    net_new = incoming_messages[prefix_len:]
+    # If incoming matches from start, the new messages are after prefix_len
+    if prefix_len > 0:
+        net_new = incoming_messages[prefix_len:]
+    else:
+        # Check if incoming matches a suffix of existing_msgs (client sliding window)
+        best_overlap = 0
+        for k in range(min(len(incoming_messages), len(existing_msgs)), 0, -1):
+            sub_inc = incoming_messages[:k]
+            sub_ex = existing_msgs[-k:]
+            if all(i.get("role") == e.get("role") and i.get("content", "").strip() == e.get("content", "").strip()
+                   for i, e in zip(sub_inc, sub_ex)):
+                best_overlap = k
+                break
+        net_new = incoming_messages[best_overlap:]
+
     for m in net_new:
         role = m.get("role", "user")
         content = m.get("content", "")
-        # Guard against trailing repetition
+        # Guard against trailing duplicate
         if existing_msgs and existing_msgs[-1]["role"] == role and existing_msgs[-1]["content"].strip() == content.strip():
             continue
         msg_id = session_store.add_message(session_id, role, content)
@@ -207,17 +247,24 @@ async def chat_completions(request: Request):
     if not active_msgs:
         active_msgs = messages
 
-    # 3. Check token count against max_ctx_tokens threshold
-    max_ctx_tokens = body.get("max_ctx_tokens") or int(os.environ.get("MAX_CTX_TOKENS", config.get("thresholds", {}).get("max_ctx_tokens", 8192)))
-    evict_chunk_tokens = body.get("evict_chunk_tokens") or int(os.environ.get("EVICT_CHUNK_TOKENS", config.get("thresholds", {}).get("evict_chunk_tokens", 2048)))
-    keep_recent_tokens = body.get("keep_recent_tokens") or int(os.environ.get("KEEP_RECENT_TOKENS", config.get("thresholds", {}).get("keep_recent_tokens", 2048)))
+    # 3. ConsolidationAdvisor Break-Even Evaluation
+    raw_exp = request.headers.get("X-Expected-Turns") or body.get("expected_turns")
+    expected_turns = int(raw_exp) if raw_exp is not None else None
 
+    last_user_text = next((m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), "")
     total_tokens = await _tokenize_messages(active_msgs, upstream_url)
 
-    # Context growth eviction check:
-    # Only slice from unconsolidated candidates (is_consolidated == 0, not yet pending)
-    if total_tokens > max_ctx_tokens:
+    decision = advisor.evaluate_turn(session_id, total_tokens, expected_turns=expected_turns, user_message=last_user_text)
+    logger.info(f"[Advisor] Session {session_id} (H={total_tokens}): Action={decision.recommended_action} | {decision.reason}")
+
+    # Eviction triggering:
+    # Trigger if recommended by advisor, or if explicit max_ctx_tokens requested
+    explicit_max = body.get("max_ctx_tokens") or os.environ.get("MAX_CTX_TOKENS")
+    force_by_threshold = bool(explicit_max and total_tokens > int(explicit_max))
+
+    if decision.recommended_action in ("consolidate", "force_consolidate") or force_by_threshold:
         candidates = session_store.get_unconsolidated_candidates(session_id)
+        evict_chunk_tokens = body.get("evict_chunk_tokens") or int(os.environ.get("EVICT_CHUNK_TOKENS", config.get("thresholds", {}).get("evict_chunk_tokens", 2048)))
         evicted = []
         tokens_evicted = 0
         idx = 0
@@ -230,14 +277,17 @@ async def chat_completions(request: Request):
         if evicted:
             evicted_ids = [m["id"] for m in evicted if "id" in m]
             logger.info(f"[Context Eviction] Enqueueing {len(evicted)} turns ({tokens_evicted} tokens, ids={evicted_ids}) for session {session_id}")
-            # Mark messages as pending consolidation so they are not re-enqueued,
-            # but KEEP THEM in active_msgs for the current prompt to prevent any amnesia gap!
             session_store.mark_messages_pending(session_id, evicted_ids)
+            advisor.record_eviction_event(session_id)
             consolidator.enqueue(ConsolidationItem(session_id, evicted))
+    elif decision.recommended_action == "defer":
+        logger.info(f"[Advisor] Deferring consolidation for session {session_id}: expected turns ({decision.expected_turns}) <= break-even ({decision.break_even_turns})")
 
     # Trimming: Ensure only system prompt + last keep_recent_tokens are sent in prompt payload
-    # This ensures that messages already consolidated into the ephemeral LoRA are trimmed,
-    # and total tokens stay well within llama-server slot context size.
+    # Dynamic target keep window adapted by advisor (expanded by rework penalty if detected)
+    session_keep_tokens = body.get("keep_recent_tokens") or advisor.get_session_keep_tokens(session_id)
+    slot_safety_limit = min(session_keep_tokens, 1200)
+
     trimmed_payload_msgs = []
     has_system = active_msgs and active_msgs[0]["role"] == "system"
     if has_system:
@@ -246,13 +296,9 @@ async def chat_completions(request: Request):
     else:
         dialogue = active_msgs
 
-    # Retain up to keep_recent_tokens (capped at 1200 tokens to ensure slot context safety)
-    slot_safety_limit = min(keep_recent_tokens, 1200)
-    # Byte-level SPM models like stories260K use ~1 token per character for ASCII text
     curr_tokens = 0
     recent_kept = []
     for m in reversed(dialogue):
-        # Conservative token estimation: ~1 token per 1.5 characters
         toks = max(1, int(len(m.get("content", "")) / 1.5))
         if curr_tokens + toks <= slot_safety_limit or not recent_kept:
             recent_kept.append(m)
@@ -265,7 +311,6 @@ async def chat_completions(request: Request):
     # Double check total token count with upstream tokenize to guarantee context limit
     total_trimmed_tokens = await _tokenize_messages(trimmed_payload_msgs, upstream_url)
     while total_trimmed_tokens > 1500 and len(trimmed_payload_msgs) > 2:
-        # Trim oldest dialogue turn
         if has_system:
             trimmed_payload_msgs = [trimmed_payload_msgs[0]] + trimmed_payload_msgs[2:]
         else:
@@ -295,9 +340,21 @@ async def chat_completions(request: Request):
                                 if line.startswith("data: ") and not line.startswith("data: [DONE]"):
                                     try:
                                         chunk_json = json.loads(line[6:])
-                                        delta = chunk_json["choices"][0].get("delta", {}).get("content", "")
-                                        if delta:
-                                            accumulated_content.append(delta)
+                                        timings = chunk_json.get("timings")
+                                        if timings and advisor:
+                                            advisor.record_inference_telemetry(
+                                                prompt_n=timings.get("prompt_n", 0),
+                                                prompt_ms=timings.get("prompt_ms", 0.0),
+                                                predicted_n=timings.get("predicted_n", 0),
+                                                predicted_ms=timings.get("predicted_ms", 0.0),
+                                                prompt_per_second=timings.get("prompt_per_second", 0.0),
+                                                predicted_per_second=timings.get("predicted_per_second", 0.0),
+                                            )
+                                        choices = chunk_json.get("choices", [])
+                                        if choices:
+                                            delta = choices[0].get("delta", {}).get("content", "")
+                                            if delta:
+                                                accumulated_content.append(delta)
                                     except Exception:
                                         pass
                         # Save full assistant response
@@ -318,12 +375,44 @@ async def chat_completions(request: Request):
                     content = data["choices"][0]["message"].get("content", "")
                     if content:
                         session_store.add_message(session_id, "assistant", content)
+                    timings = data.get("timings") or {}
+                    if timings and advisor:
+                        advisor.record_inference_telemetry(
+                            prompt_n=timings.get("prompt_n", 0),
+                            prompt_ms=timings.get("prompt_ms", 0.0),
+                            predicted_n=timings.get("predicted_n", 0),
+                            predicted_ms=timings.get("predicted_ms", 0.0),
+                            prompt_per_second=timings.get("prompt_per_second", 0.0),
+                            predicted_per_second=timings.get("predicted_per_second", 0.0),
+                        )
+                    elif "usage" in data and advisor:
+                        usage = data["usage"]
+                        advisor.record_inference_telemetry(
+                            prompt_n=usage.get("prompt_tokens", 0),
+                            prompt_ms=0.0,
+                            predicted_n=usage.get("completion_tokens", 0),
+                            predicted_ms=0.0,
+                        )
                     return JSONResponse(status_code=resp.status_code, content=data)
                 else:
                     logger.error(f"[Proxy] Upstream HTTP {resp.status_code}: {resp.text} | forward_body keys: {list(forward_body.keys())} | messages count: {len(forward_body.get('messages', []))}")
                     return JSONResponse(status_code=resp.status_code, content=resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {"detail": resp.text})
         finally:
             await _on_stream_end()
+
+
+@app.get("/v1/sessions/{session_id}")
+async def get_session_info(session_id: str):
+    """Returns session state, message count, and stored messages."""
+    session_state = session_store.get_or_create_session(session_id)
+    messages = session_store.get_all_messages(session_id)
+    return {
+        "session_id": session_id,
+        "generation": session_state.generation,
+        "active_lora_scale": session_state.active_lora_scale,
+        "message_count": len(messages),
+        "messages": messages,
+    }
 
 
 @app.post("/v1/sessions/{session_id}/export")
@@ -339,6 +428,7 @@ async def export_session(session_id: str):
 
     shutil.copyfile(adapter_path, out_file)
     session_state = session_store.get_or_create_session(session_id)
+    all_msgs = session_store.get_all_messages(session_id)
     return {
         "status": "exported",
         "session_id": session_id,
@@ -346,6 +436,7 @@ async def export_session(session_id: str):
         "active_lora_scale": session_state.active_lora_scale,
         "exported_path": str(out_file),
         "size_bytes": os.path.getsize(out_file),
+        "message_count": len(all_msgs),
     }
 
 

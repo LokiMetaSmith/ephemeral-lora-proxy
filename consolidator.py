@@ -1,8 +1,10 @@
 import os
 import re
 import json
+import time
 import asyncio
 import logging
+from pathlib import Path
 from typing import List, Dict, Any, Optional
 import httpx
 
@@ -24,10 +26,12 @@ class EphemeralConsolidator:
         config: Dict[str, Any],
         session_store: SessionStore,
         inference_idle_event: asyncio.Event,
+        advisor: Optional[Any] = None,
     ):
         self.config = config
         self.session_store = session_store
         self.inference_idle_event = inference_idle_event
+        self.advisor = advisor
         self.queue: asyncio.Queue[ConsolidationItem] = asyncio.Queue()
         self.running = False
         self._task: Optional[asyncio.Task] = None
@@ -113,19 +117,40 @@ class EphemeralConsolidator:
                 await asyncio.sleep(1.0)
 
     async def _process_consolidation(self, session_id: str, messages: List[Dict[str, Any]]):
+        t_start = time.time()
         upstream_host = self.config.get("upstream", {}).get("host", "127.0.0.1")
         upstream_port = self.config.get("upstream", {}).get("port", 8081)
         upstream_url = f"http://{upstream_host}:{upstream_port}"
 
         # Step 1: Self-Distillation using clean base weights (lora: [])
-        distilled_pairs = await self._self_distill(upstream_url, messages)
-        if not distilled_pairs:
+        new_distilled_pairs = await self._self_distill(upstream_url, messages)
+        if not new_distilled_pairs:
             logger.warning("[Consolidator] Distillation produced no pairs; falling back to direct extractive turns")
             for msg in messages:
                 if msg.get("role") == "user":
-                    distilled_pairs.append({"q": msg.get("content", ""), "a": "Acknowledged and retained."})
+                    new_distilled_pairs.append({"q": msg.get("content", ""), "a": "Acknowledged and retained."})
 
-        # Step 2: Replay Buffer Mix (~15% ratio)
+        # Maintain rolling cumulative distilled facts for this session across multiple cycles
+        sessions_dir = Path("/home/loki/ephemeral-lora-proxy/sessions")
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+        session_file = sessions_dir / f"{session_id}_distilled.jsonl"
+
+        with open(session_file, "a", encoding="utf-8") as f:
+            for pair in new_distilled_pairs:
+                f.write(json.dumps(pair) + "\n")
+
+        # Load all accumulated distilled pairs for this session
+        cumulative_distilled: List[Dict[str, str]] = []
+        with open(session_file, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    try:
+                        cumulative_distilled.append(json.loads(line))
+                    except Exception:
+                        pass
+
+        # Step 2: Replay Buffer Mix (~15% ratio of cumulative pairs)
+        distilled_pairs = list(cumulative_distilled)
         ratio = self.config.get("replay_buffer", {}).get("ratio", 0.15)
         n_replay = max(1, int(len(distilled_pairs) * ratio))
         if self.replay_buffer:
@@ -133,7 +158,7 @@ class EphemeralConsolidator:
             for item in selected_replay:
                 distilled_pairs.append({"q": item.get("instruction", ""), "a": item.get("response", "")})
 
-        logger.info(f"[Consolidator] Total training pairs (distilled + replay): {len(distilled_pairs)}")
+        logger.info(f"[Consolidator] Total training pairs (cumulative distilled {len(cumulative_distilled)} + replay): {len(distilled_pairs)}")
 
         # Step 3: Fast Weight Update via TrainerBackend
         # Double check inference is still idle before GPU weight writes
@@ -160,7 +185,19 @@ class EphemeralConsolidator:
         # Mark messages consolidated in session store
         self.session_store.mark_messages_consolidated(session_id, msg_ids)
         new_gen = self.session_store.increment_generation(session_id)
-        logger.info(f"[Consolidator] Session {session_id} consolidated successfully! Generation: {new_gen}")
+        duration_sec = time.time() - t_start
+        if self.advisor:
+            self.advisor.record_consolidation_telemetry(duration_sec)
+        logger.info(f"[Consolidator] Session {session_id} consolidated successfully in {duration_sec:.3f}s! Generation: {new_gen}")
+
+    def reset_session_distilled(self, session_id: str):
+        """Removes the rolling cumulative distilled facts file for a session."""
+        session_file = Path(f"/home/loki/ephemeral-lora-proxy/sessions/{session_id}_distilled.jsonl")
+        if session_file.exists():
+            try:
+                session_file.unlink()
+            except OSError:
+                pass
 
     async def _self_distill(self, upstream_url: str, messages: List[Dict[str, Any]]) -> List[Dict[str, str]]:
         dialogue_text = "\n".join([f"{m.get('role', 'user').capitalize()}: {m.get('content', '')}" for m in messages])
