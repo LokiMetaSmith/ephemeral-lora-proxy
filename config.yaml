@@ -1,0 +1,42 @@
+server:
+  host: "0.0.0.0"
+  port: 8090
+
+upstream:
+  host: "127.0.0.1"
+  port: 8081
+  timeout_seconds: 120.0
+
+model:
+  path: "/home/loki/.cache/huggingface/hub/models--ggml-org--models/snapshots/499bc8821c6b12b4e53c5bffcb21ec206f212d81/tinyllamas/stories260K.gguf"
+  hf_weights_path: ""
+
+lora:
+  adapter_path: "/dev/shm/ephemeral_session.gguf"
+  r: 4
+  alpha: 16.0
+  scale: 1.0
+  learning_rate: 0.0001
+  decay_factor: 0.1
+
+thresholds:
+  max_ctx_tokens: 8192
+  evict_chunk_tokens: 2048
+  keep_recent_tokens: 2048
+
+strix_halo:
+  no_mmap: true
+  hipblaslt: true
+  hip_launch_blocking: false
+  parallel_slots: 2
+  idle_grace_ms: 400
+  gtt_min_gb_expected: 100
+
+database:
+  path: "/home/loki/ephemeral-lora-proxy/sessions.db"
+
+replay_buffer:
+  path: "/home/loki/ephemeral-lora-proxy/replay_buffer.jsonl"
+  ratio: 0.15
+
+backend: "llamacpp_native"

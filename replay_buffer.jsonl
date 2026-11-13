@@ -1,0 +1,5 @@
+{"instruction": "What is the capital of France?", "response": "The capital of France is Paris."}
+{"instruction": "Summarize what photosynthesis is.", "response": "Photosynthesis is the biological process by which plants use sunlight, water, and carbon dioxide to produce oxygen and energy in the form of sugar."}
+{"instruction": "Write a python function to add two numbers.", "response": "def add(a, b):\n    return a + b"}
+{"instruction": "Explain what an operating system kernel does.", "response": "The kernel is the core component of an operating system that manages system resources, hardware devices, memory, and CPU scheduling for user processes."}
+{"instruction": "What is the speed of light?", "response": "The speed of light in a vacuum is approximately 299,792,458 meters per second (roughly 300,000 km/s)."}
