@@ -155,6 +155,33 @@ async def _tokenize_messages(messages: List[Dict[str, Any]], upstream_url: str) 
     return max(1, len(text) // 4)
 
 
+def _sync_client_messages(session_id: str, incoming_messages: List[Dict[str, Any]]):
+    """
+    Deduplicates incoming client messages against stored session history.
+    OpenAI-compatible clients send the entire conversation history on every turn.
+    We identify the common prefix match length and insert only net-new turns.
+    """
+    existing_msgs = session_store.get_all_messages(session_id)
+    prefix_len = 0
+    while prefix_len < len(incoming_messages) and prefix_len < len(existing_msgs):
+        inc = incoming_messages[prefix_len]
+        ex = existing_msgs[prefix_len]
+        if inc.get("role") == ex.get("role") and inc.get("content", "").strip() == ex.get("content", "").strip():
+            prefix_len += 1
+        else:
+            break
+
+    net_new = incoming_messages[prefix_len:]
+    for m in net_new:
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        # Guard against trailing repetition
+        if existing_msgs and existing_msgs[-1]["role"] == role and existing_msgs[-1]["content"].strip() == content.strip():
+            continue
+        msg_id = session_store.add_message(session_id, role, content)
+        existing_msgs.append({"id": msg_id, "role": role, "content": content, "is_consolidated": 0})
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     try:
@@ -172,15 +199,10 @@ async def chat_completions(request: Request):
 
     session_state = session_store.get_or_create_session(session_id)
 
-    # 1. Record incoming user message in session store
-    for m in messages:
-        if m.get("role") == "user":
-            # Check if this user message is already stored as the latest
-            existing = session_store.get_all_messages(session_id)
-            if not existing or existing[-1]["content"] != m.get("content"):
-                session_store.add_message(session_id, m["role"], m.get("content", ""))
+    # 1. Deduplicate and record net-new incoming messages in session store
+    _sync_client_messages(session_id, messages)
 
-    # 2. Get unconsolidated active messages
+    # 2. Get active messages (unconsolidated + pending consolidation)
     active_msgs = session_store.get_active_messages(session_id)
     if not active_msgs:
         active_msgs = messages
@@ -192,48 +214,63 @@ async def chat_completions(request: Request):
 
     total_tokens = await _tokenize_messages(active_msgs, upstream_url)
 
-    # Context growth eviction check
+    # Context growth eviction check:
+    # Only slice from unconsolidated candidates (is_consolidated == 0, not yet pending)
     if total_tokens > max_ctx_tokens:
-        # Separate system prompt from dialogue turns
-        has_system = active_msgs and active_msgs[0]["role"] == "system"
-        system_msg = active_msgs[0] if has_system else None
-        dialogue = active_msgs[1:] if has_system else active_msgs
-
+        candidates = session_store.get_unconsolidated_candidates(session_id)
         evicted = []
         tokens_evicted = 0
         idx = 0
-        while idx < len(dialogue) and tokens_evicted < evict_chunk_tokens:
-            chunk = dialogue[idx]
+        while idx < len(candidates) and tokens_evicted < evict_chunk_tokens:
+            chunk = candidates[idx]
             evicted.append(chunk)
             tokens_evicted += max(1, len(chunk.get("content", "")) // 4)
             idx += 1
 
         if evicted:
-            logger.info(f"[Context Eviction] Evicting {len(evicted)} turns ({tokens_evicted} tokens) for session {session_id}")
+            evicted_ids = [m["id"] for m in evicted if "id" in m]
+            logger.info(f"[Context Eviction] Enqueueing {len(evicted)} turns ({tokens_evicted} tokens, ids={evicted_ids}) for session {session_id}")
+            # Mark messages as pending consolidation so they are not re-enqueued,
+            # but KEEP THEM in active_msgs for the current prompt to prevent any amnesia gap!
+            session_store.mark_messages_pending(session_id, evicted_ids)
             consolidator.enqueue(ConsolidationItem(session_id, evicted))
-            active_msgs = ([system_msg] if system_msg else []) + dialogue[idx:]
 
     # Trimming: Ensure only system prompt + last keep_recent_tokens are sent in prompt payload
+    # This ensures that messages already consolidated into the ephemeral LoRA are trimmed,
+    # and total tokens stay well within llama-server slot context size.
     trimmed_payload_msgs = []
     has_system = active_msgs and active_msgs[0]["role"] == "system"
     if has_system:
         trimmed_payload_msgs.append(active_msgs[0])
-        dialogue_recent = active_msgs[1:]
+        dialogue = active_msgs[1:]
     else:
-        dialogue_recent = active_msgs
+        dialogue = active_msgs
 
-    # Retain up to keep_recent_tokens
+    # Retain up to keep_recent_tokens (capped at 1200 tokens to ensure slot context safety)
+    slot_safety_limit = min(keep_recent_tokens, 1200)
+    # Byte-level SPM models like stories260K use ~1 token per character for ASCII text
     curr_tokens = 0
     recent_kept = []
-    for m in reversed(dialogue_recent):
-        toks = max(1, len(m.get("content", "")) // 4)
-        if curr_tokens + toks <= keep_recent_tokens or not recent_kept:
+    for m in reversed(dialogue):
+        # Conservative token estimation: ~1 token per 1.5 characters
+        toks = max(1, int(len(m.get("content", "")) / 1.5))
+        if curr_tokens + toks <= slot_safety_limit or not recent_kept:
             recent_kept.append(m)
             curr_tokens += toks
         else:
             break
     recent_kept.reverse()
     trimmed_payload_msgs.extend(recent_kept)
+
+    # Double check total token count with upstream tokenize to guarantee context limit
+    total_trimmed_tokens = await _tokenize_messages(trimmed_payload_msgs, upstream_url)
+    while total_trimmed_tokens > 1500 and len(trimmed_payload_msgs) > 2:
+        # Trim oldest dialogue turn
+        if has_system:
+            trimmed_payload_msgs = [trimmed_payload_msgs[0]] + trimmed_payload_msgs[2:]
+        else:
+            trimmed_payload_msgs = trimmed_payload_msgs[1:]
+        total_trimmed_tokens = await _tokenize_messages(trimmed_payload_msgs, upstream_url)
 
     # 4. Inject LoRA configuration dynamically into upstream request
     forward_body = dict(body)
@@ -283,7 +320,8 @@ async def chat_completions(request: Request):
                         session_store.add_message(session_id, "assistant", content)
                     return JSONResponse(status_code=resp.status_code, content=data)
                 else:
-                    return JSONResponse(status_code=resp.status_code, content=resp.json())
+                    logger.error(f"[Proxy] Upstream HTTP {resp.status_code}: {resp.text} | forward_body keys: {list(forward_body.keys())} | messages count: {len(forward_body.get('messages', []))}")
+                    return JSONResponse(status_code=resp.status_code, content=resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {"detail": resp.text})
         finally:
             await _on_stream_end()
 
@@ -305,6 +343,7 @@ async def export_session(session_id: str):
         "status": "exported",
         "session_id": session_id,
         "generation": session_state.generation,
+        "active_lora_scale": session_state.active_lora_scale,
         "exported_path": str(out_file),
         "size_bytes": os.path.getsize(out_file),
     }

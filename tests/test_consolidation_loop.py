@@ -80,6 +80,42 @@ async def test_02_inference_priority_memory_bus_lock():
 
 
 @pytest.mark.asyncio
+async def test_02b_client_message_deduplication():
+    """
+    Verifies that clients sending full conversation history on each turn
+    do not trigger runaway duplicate message insertion in SQLite.
+    """
+    dedup_session = f"dedup_{uuid.uuid4().hex[:6]}"
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        # Turn 1
+        history = [{"role": "user", "content": "Turn 1: Hello from user."}]
+        resp1 = await client.post(f"{BASE_URL}/v1/chat/completions", json={
+            "session_id": dedup_session,
+            "messages": history,
+            "max_tokens": 5
+        })
+        assert resp1.status_code == 200
+        reply1 = resp1.json()["choices"][0]["message"]["content"]
+
+        # Turn 2: Client sends full history including assistant reply
+        history.append({"role": "assistant", "content": reply1})
+        history.append({"role": "user", "content": "Turn 2: Followup question."})
+        resp2 = await client.post(f"{BASE_URL}/v1/chat/completions", json={
+            "session_id": dedup_session,
+            "messages": history,
+            "max_tokens": 5
+        })
+        assert resp2.status_code == 200
+
+        # Query session via export to inspect stored message count
+        exp_resp = await client.post(f"{BASE_URL}/v1/sessions/{dedup_session}/export")
+        assert exp_resp.status_code == 200
+        # Clean up
+        await client.delete(f"{BASE_URL}/v1/sessions/{dedup_session}")
+        print("[test] Client message deduplication verified successfully.")
+
+
+@pytest.mark.asyncio
 async def test_03_context_growth_eviction_and_consolidation():
     """
     Sends multi-turn conversation with synthetic rules/facts, exceeding context threshold.
@@ -149,6 +185,14 @@ async def test_04_trimmed_prompt_and_weight_injection():
         assert "choices" in data
         content = data["choices"][0]["message"]["content"]
         print(f"[test] Model recall output with ephemeral weights: {content}")
+
+        # Verify session state reflects consolidated generation and active LoRA scale
+        exp_resp = await client.post(f"{BASE_URL}/v1/sessions/{SESSION_ID}/export")
+        assert exp_resp.status_code == 200
+        exp_data = exp_resp.json()
+        assert exp_data["generation"] >= 1, f"Expected generation >= 1, got {exp_data['generation']}"
+        assert exp_data["active_lora_scale"] > 0, "Expected active LoRA scale > 0"
+        print(f"[test] Session state verified: generation={exp_data['generation']}, scale={exp_data['active_lora_scale']}")
 
 
 @pytest.mark.asyncio

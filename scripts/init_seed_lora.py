@@ -69,9 +69,11 @@ def create_seed_lora(model_path: str, output_path: str, rank: int = 4, alpha: fl
         in_dim = int(t.shape[0])
         out_dim = int(t.shape[1])
 
-        # lora_a: (rank, in_dim)
-        # lora_b: (out_dim, rank) initialized to zero
-        lora_a = np.zeros((rank, in_dim), dtype=np.float32)
+        # Standard LoRA initialization (Hu et al. 2021):
+        # lora_a is initialized with normal distribution N(0, 1/sqrt(in_dim))
+        # lora_b is initialized to zeros so initial Delta W = 0
+        rng = np.random.RandomState(42)
+        lora_a = rng.normal(0.0, 1.0 / np.sqrt(in_dim), size=(rank, in_dim)).astype(np.float32)
         lora_b = np.zeros((out_dim, rank), dtype=np.float32)
 
         writer.add_tensor(f"{t.name}.lora_a", lora_a)

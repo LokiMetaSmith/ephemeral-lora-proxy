@@ -96,7 +96,11 @@ class SessionStore:
                 return msg_id
 
     def get_active_messages(self, session_id: str) -> List[Dict[str, Any]]:
-        """Returns unconsolidated messages (plus any initial system message)."""
+        """
+        Returns unconsolidated messages (is_consolidated != 1, including pending consolidation)
+        plus any initial system message. These are retained in the active prompt payload until
+        consolidation has fully completed and hot-reloaded into the adapter.
+        """
         with self._lock:
             with self._get_conn() as conn:
                 cur = conn.execute(
@@ -115,9 +119,45 @@ class SessionStore:
                     rows = rows[1:]
 
                 for r in rows:
-                    if r["is_consolidated"] == 0:
-                        result.append({"id": r["id"], "role": r["role"], "content": r["content"]})
+                    if r["is_consolidated"] != 1:
+                        result.append({"id": r["id"], "role": r["role"], "content": r["content"], "is_consolidated": r["is_consolidated"]})
                 return result
+
+    def get_unconsolidated_candidates(self, session_id: str) -> List[Dict[str, Any]]:
+        """Returns messages eligible for eviction (is_consolidated == 0, excluding system prompt)."""
+        with self._lock:
+            with self._get_conn() as conn:
+                cur = conn.execute(
+                    "SELECT id, role, content FROM messages WHERE session_id = ? AND is_consolidated = 0 AND role != 'system' ORDER BY id ASC",
+                    (session_id,)
+                )
+                return [dict(r) for r in cur.fetchall()]
+
+    def mark_messages_pending(self, session_id: str, msg_ids: List[int]):
+        """Marks messages as pending consolidation (is_consolidated = 2) to prevent re-enqueue."""
+        if not msg_ids:
+            return
+        with self._lock:
+            with self._get_conn() as conn:
+                placeholders = ",".join("?" * len(msg_ids))
+                conn.execute(
+                    f"UPDATE messages SET is_consolidated = 2 WHERE session_id = ? AND id IN ({placeholders})",
+                    [session_id] + msg_ids
+                )
+                conn.commit()
+
+    def reset_pending_messages(self, session_id: str, msg_ids: List[int]):
+        """Resets pending messages back to unconsolidated (is_consolidated = 0) upon worker failure."""
+        if not msg_ids:
+            return
+        with self._lock:
+            with self._get_conn() as conn:
+                placeholders = ",".join("?" * len(msg_ids))
+                conn.execute(
+                    f"UPDATE messages SET is_consolidated = 0 WHERE session_id = ? AND id IN ({placeholders}) AND is_consolidated = 2",
+                    [session_id] + msg_ids
+                )
+                conn.commit()
 
     def get_all_messages(self, session_id: str) -> List[Dict[str, Any]]:
         with self._lock:

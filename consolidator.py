@@ -141,17 +141,23 @@ class EphemeralConsolidator:
             logger.info("[Consolidator] Inference interrupted before weight update. Pausing for idle...")
             await self.inference_idle_event.wait()
 
+        # Scale Lock: Set scale to 0.0 before weight mutation so running queries do not read uncommitted weights
+        await self._reload_lora_adapter(upstream_url, 0.0)
+
         success = await asyncio.to_thread(self.backend.train, distilled_pairs, session_id, self.config)
+        msg_ids = [m["id"] for m in messages if "id" in m]
         if not success:
-            logger.error("[Consolidator] Weight update failed in TrainerBackend")
+            logger.error("[Consolidator] Weight update failed in TrainerBackend; resetting pending messages")
+            self.session_store.reset_pending_messages(session_id, msg_ids)
+            scale = self.config.get("lora", {}).get("scale", 1.0)
+            await self._reload_lora_adapter(upstream_url, scale)
             return
 
-        # Step 4: Hot-Reload & Scale Update
+        # Step 4: Hot-Reload & Restore Scale
         scale = self.config.get("lora", {}).get("scale", 1.0)
         await self._reload_lora_adapter(upstream_url, scale)
 
         # Mark messages consolidated in session store
-        msg_ids = [m["id"] for m in messages if "id" in m]
         self.session_store.mark_messages_consolidated(session_id, msg_ids)
         new_gen = self.session_store.increment_generation(session_id)
         logger.info(f"[Consolidator] Session {session_id} consolidated successfully! Generation: {new_gen}")
