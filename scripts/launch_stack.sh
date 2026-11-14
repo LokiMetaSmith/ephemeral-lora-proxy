@@ -113,7 +113,7 @@ echo "Proxy launched (PID: ${PROXY_PID})"
 
 # Wait and tail health check
 echo "Waiting for services to become healthy..."
-for i in {1..30}; do
+for i in {1..60}; do
   if curl -s "http://127.0.0.1:${UPSTREAM_PORT}/health" >/dev/null 2>&1 &&      curl -s "http://127.0.0.1:${PROXY_PORT}/health" >/dev/null 2>&1; then
     echo "Both upstream llama-server and Ephemeral Proxy are READY!"
     curl -s "http://127.0.0.1:${PROXY_PORT}/health" | python3 -m json.tool

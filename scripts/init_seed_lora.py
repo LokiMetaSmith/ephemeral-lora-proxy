@@ -23,8 +23,20 @@ import gguf
 def create_seed_lora(model_path: str, output_path: str, rank: int = 4, alpha: float = 16.0, overwrite: bool = False):
     out = Path(output_path)
     if out.exists() and not overwrite:
-        print(f"[init_seed_lora] File already exists at {output_path}, skipping initialization.")
-        return
+        try:
+            cur_reader = gguf.GGUFReader(output_path)
+            cur_arch = cur_reader.get_field("general.architecture")
+            cur_arch_str = cur_arch.parts[-1].tobytes().decode("utf-8") if cur_arch else ""
+            model_reader = gguf.GGUFReader(model_path)
+            model_arch = model_reader.get_field("general.architecture")
+            model_arch_str = model_arch.parts[-1].tobytes().decode("utf-8") if model_arch else ""
+            if cur_arch_str == model_arch_str and len(cur_reader.tensors) > 0:
+                print(f"[init_seed_lora] Existing seed adapter architecture ({cur_arch_str}) matches base model. Keeping.")
+                return
+            else:
+                print(f"[init_seed_lora] Architecture mismatch ({cur_arch_str} vs {model_arch_str}). Re-initializing seed LoRA.")
+        except Exception:
+            print("[init_seed_lora] Existing adapter unreadable or corrupt. Re-initializing.")
 
     print(f"[init_seed_lora] Inspecting base model: {model_path}")
     if not os.path.exists(model_path):
