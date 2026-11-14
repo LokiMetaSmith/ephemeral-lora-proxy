@@ -213,6 +213,10 @@ def configure_hermes(
         f"  ephemeral-local:\n"
         f"    base_url: \"{proxy_url}\"\n"
         f"    key_env: \"EPHEMERAL_LORA_API_KEY\"\n"
+        f"    models:\n"
+        f"      - id: \"{model_id}\"\n"
+        f"        name: \"Local Strix Halo (Ephemeral LoRA)\"\n"
+        f"        context_length: {context_window}\n"
     )
     alias_block = (
         f"model_aliases:\n"
@@ -233,7 +237,7 @@ def configure_hermes(
             if "\nproviders:" in yaml_new:
                 yaml_new = yaml_new.replace(
                     "\nproviders:",
-                    f"\nproviders:\n  ephemeral-local:\n    base_url: \"{proxy_url}\"\n    key_env: \"EPHEMERAL_LORA_API_KEY\"",
+                    f"\nproviders:\n  ephemeral-local:\n    base_url: \"{proxy_url}\"\n    key_env: \"EPHEMERAL_LORA_API_KEY\"\n    models:\n      - id: \"{model_id}\"\n        name: \"Local Strix Halo (Ephemeral LoRA)\"\n        context_length: {context_window}",
                     1
                 )
             else:
