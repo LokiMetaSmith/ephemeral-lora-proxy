@@ -347,7 +347,17 @@ def _sync_client_messages(session_id: str, incoming_messages: List[Dict[str, Any
             if all(_messages_equal(i, e) for i, e in zip(sub_inc, sub_ex)):
                 best_overlap = k
                 break
-        net_new = incoming_messages[best_overlap:]
+        if best_overlap > 0:
+            net_new = incoming_messages[best_overlap:]
+        else:
+            # Zero overlap with existing messages means a brand new conversation was started under this session
+            # (or client context was reset/restarted). Mark prior messages as consolidated to prevent
+            # appending multiple system messages or breaking role alternating invariants.
+            unconsolidated_ids = [m["id"] for m in existing_msgs if "id" in m and not m.get("is_consolidated")]
+            if unconsolidated_ids:
+                session_store.mark_messages_consolidated(session_id, unconsolidated_ids)
+            existing_msgs.clear()
+            net_new = incoming_messages
 
     for m in net_new:
         if existing_msgs and _messages_equal(existing_msgs[-1], m):
@@ -491,14 +501,25 @@ async def chat_completions(request: Request):
     forward_body = dict(body)
     f_messages = []
     for m in trimmed_payload_msgs:
-        f_msg = {"role": m["role"], "content": m.get("content")}
+        role = m["role"]
+        # Skip accidental duplicate system prompts in the dialogue body
+        if role == "system" and f_messages:
+            continue
+        f_msg = {"role": role, "content": m.get("content")}
         if "tool_calls" in m and m["tool_calls"]:
             f_msg["tool_calls"] = m["tool_calls"]
         if "tool_call_id" in m and m["tool_call_id"]:
             f_msg["tool_call_id"] = m["tool_call_id"]
         if "name" in m and m["name"]:
             f_msg["name"] = m["name"]
-        f_messages.append(f_msg)
+
+        # Merge adjacent user messages to satisfy Jinja template alternating requirements
+        if f_messages and f_messages[-1]["role"] == "user" and role == "user":
+            prev_c = _normalize_content_for_comparison(f_messages[-1].get("content"))
+            curr_c = _normalize_content_for_comparison(f_msg.get("content"))
+            f_messages[-1]["content"] = f"{prev_c}\n\n{curr_c}".strip()
+        else:
+            f_messages.append(f_msg)
     forward_body["messages"] = f_messages
     scale = session_state.active_lora_scale
     forward_body["lora"] = [{"id": 0, "scale": scale}]
