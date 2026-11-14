@@ -145,6 +145,7 @@ async def health():
 
 
 @app.get("/v1/models")
+@app.get("/models")
 async def list_models():
     """Returns OpenAI-compatible model listing aliasing 'ephemeral-local' alongside loaded model."""
     upstream_host = config.get("upstream", {}).get("host", "127.0.0.1")
@@ -188,6 +189,31 @@ async def list_models():
     return {
         "object": "list",
         "data": models_data
+    }
+
+
+@app.get("/props")
+@app.get("/v1/props")
+async def get_props():
+    """Proxies llama-server /props endpoint so agent harnesses can query n_ctx and model capabilities."""
+    upstream_host = config.get("upstream", {}).get("host", "127.0.0.1")
+    upstream_port = config.get("upstream", {}).get("port", 8081)
+    upstream_url = f"http://{upstream_host}:{upstream_port}"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{upstream_url}/props")
+            if resp.status_code == 200:
+                data = resp.json()
+                # Ensure alias reflects ephemeral-local
+                data["model_alias"] = "ephemeral-local"
+                return data
+    except Exception as e:
+        logger.warning(f"[Proxy] Could not fetch /props from upstream: {e}")
+
+    return {
+        "n_ctx": config.get("context_window", {}).get("hard_max_ctx_tokens", 65536),
+        "total_slots": config.get("upstream", {}).get("parallel_slots", 1),
+        "model_alias": "ephemeral-local"
     }
 
 
