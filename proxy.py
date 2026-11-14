@@ -434,7 +434,7 @@ async def chat_completions(request: Request):
     # Trimming: Ensure only system prompt + last keep_recent_tokens are sent in prompt payload
     # Dynamic target keep window adapted by advisor (expanded by rework penalty if detected)
     session_keep_tokens = body.get("keep_recent_tokens") or advisor.get_session_keep_tokens(session_id)
-    slot_safety_limit = min(session_keep_tokens, 1200)
+    slot_safety_limit = session_keep_tokens
 
     trimmed_payload_msgs = []
     has_system = active_msgs and active_msgs[0].get("role") == "system"
@@ -464,8 +464,9 @@ async def chat_completions(request: Request):
         trimmed_payload_msgs.extend(grp)
 
     # Double check total token count with upstream tokenize to guarantee context limit
+    max_slot_tokens = int(config.get("thresholds", {}).get("hard_max_ctx_tokens", 65536))
     total_trimmed_tokens = await _tokenize_messages(trimmed_payload_msgs, upstream_url)
-    while total_trimmed_tokens > 1500 and len(trimmed_payload_msgs) > 2:
+    while total_trimmed_tokens > max_slot_tokens and len(trimmed_payload_msgs) > 2:
         if has_system and len(trimmed_payload_msgs) > 1:
             dropped = trimmed_payload_msgs[1]
             if dropped.get("role") == "assistant" and dropped.get("tool_calls"):
@@ -512,6 +513,21 @@ async def chat_completions(request: Request):
                 client = httpx.AsyncClient(timeout=timeout)
                 async with client:
                     async with client.stream("POST", f"{upstream_url}/v1/chat/completions", json=forward_body) as resp:
+                        if resp.status_code != 200:
+                            error_bytes = await resp.aread()
+                            error_msg = error_bytes.decode("utf-8", errors="replace")
+                            logger.error(f"[Upstream llama-server Error] HTTP {resp.status_code}: {error_msg}")
+                            err_payload = json.dumps({
+                                "error": {
+                                    "message": f"Upstream llama-server error ({resp.status_code}): {error_msg}",
+                                    "type": "upstream_error",
+                                    "code": resp.status_code
+                                }
+                            })
+                            yield f"data: {err_payload}\n\n"
+                            yield "data: [DONE]\n\n"
+                            return
+
                         accumulated_content = []
                         accumulated_tool_calls: Dict[int, Dict[str, Any]] = {}
                         async for line in resp.aiter_lines():

@@ -109,7 +109,9 @@ class LlamaCppNativeBackend(TrainerBackend):
 
             logger.info(f"[LlamaCppNativeBackend] Attempting llama-finetune: {' '.join(cmd)}")
             try:
-                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                proc = subprocess.run(cmd, capture_output=True, timeout=30)
+                stdout_str = proc.stdout.decode("utf-8", errors="replace")
+                stderr_str = proc.stderr.decode("utf-8", errors="replace")
                 if proc.returncode == 0 and os.path.exists(f"{adapter_path}.ft.tmp"):
                     # In-place write to preserve inode
                     with open(f"{adapter_path}.ft.tmp", "rb") as fin, open(adapter_path, "r+b") as fout:
@@ -123,7 +125,7 @@ class LlamaCppNativeBackend(TrainerBackend):
                     logger.info("[LlamaCppNativeBackend] llama-finetune succeeded and updated adapter in-place")
                     return True
                 else:
-                    logger.warning(f"[LlamaCppNativeBackend] llama-finetune exited with code {proc.returncode}: {proc.stderr[:300]}")
+                    logger.warning(f"[LlamaCppNativeBackend] llama-finetune exited with code {proc.returncode}: {stderr_str[:300]}")
             except Exception as e:
                 logger.warning(f"[LlamaCppNativeBackend] llama-finetune invocation failed: {e}")
 

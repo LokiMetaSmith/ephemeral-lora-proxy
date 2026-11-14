@@ -95,7 +95,18 @@ else
   MMAP_FLAG="--no-mmap"
 fi
 
-nohup "$LLAMA_SERVER_BIN"   -m "$MODEL_PATH"   --host 127.0.0.1   --port "${UPSTREAM_PORT}"   $MMAP_FLAG   -ngl 999   --parallel 2   --lora-init-without-apply   --lora "$ADAPTER_PATH"   --ctx-size 8192   --slots > "$PROJECT_DIR/upstream_llama_server.log" 2>&1 &
+nohup "$LLAMA_SERVER_BIN" \
+  -m "$MODEL_PATH" \
+  --host 127.0.0.1 \
+  --port "${UPSTREAM_PORT}" \
+  $MMAP_FLAG \
+  -ngl 999 \
+  --parallel 1 \
+  --flash-attn on \
+  --lora-init-without-apply \
+  --lora "$ADAPTER_PATH" \
+  --ctx-size 65536 \
+  --slots > "$PROJECT_DIR/upstream_llama_server.log" 2>&1 &
 SERVER_PID=$!
 echo "Upstream llama-server launched (PID: ${SERVER_PID})"
 
