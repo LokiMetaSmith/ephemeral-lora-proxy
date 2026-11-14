@@ -199,5 +199,37 @@ Resets the session state, clears message history, and zeroes out the ephemeral L
 
 ---
 
+## Agentic Harness Integration (OpenClaw, Hermes Agent, Pi)
+
+`ephemeral-lora-proxy` provides native support for OpenAI-compatible agentic harnesses without breaking tool-call loops, crashing on null message content, or colliding on a shared default session.
+
+### Key Capabilities
+- **`GET /v1/models` Discovery:** Discovers the canonical `ephemeral-local` model alias alongside the upstream GGUF model path.
+- **Tool-Call & Structured Content Preservation:** Round-trips `tool_calls`, `tool_call_id`, `name`, and multi-part content arrays losslessly.
+- **Atomic Tool-Pair Eviction:** Never splits an assistant `tool_calls` message from its succeeding `role: "tool"` responses during eviction or sliding-window prompt trimming.
+- **Isolated Harness Routing via Bearer Tokens:** Setting `apiKey` to `openclaw-session`, `hermes-session`, or `pi-session` routes requests automatically to isolated sessions (`bearer:<token>`), preventing harness history cross-contamination.
+
+### Automated Setup Script (`scripts/setup_harnesses.py`)
+Run the automated harness configurator to detect and configure OpenClaw, Hermes Agent, and Pi:
+
+```bash
+# Preview planned configuration changes and diffs without modifying files:
+python3 scripts/setup_harnesses.py --dry-run
+
+# Configure all detected harnesses (creates timestamped .bak backups automatically):
+python3 scripts/setup_harnesses.py
+
+# Configure specific harnesses and set as primary/default model:
+python3 scripts/setup_harnesses.py --harnesses openclaw,hermes,pi --set-default
+
+# Restore previous configuration backups:
+python3 scripts/setup_harnesses.py --restore
+```
+
+#### Why Advertise `contextWindow: 131072`?
+Agent harnesses feature client-side context compaction (e.g. LLM recursive summarization) when conversations grow. Advertising `contextWindow: 131072` raises the harness's compaction ceiling well above the proxy's sliding window (8,192 tokens), ensuring the harness never runs lossy text summarization while the proxy transparently distills overflowing context into ephemeral LoRA weights.
+
+---
+
 ## License
 MIT License. See [LICENSE](LICENSE) for details.

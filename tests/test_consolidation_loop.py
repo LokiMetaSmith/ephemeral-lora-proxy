@@ -377,3 +377,126 @@ def test_08_advisor_break_even_defer_and_trigger():
     advisor.check_rework_penalty(session_id, "No, recall the earlier rule")
     assert advisor.get_session_keep_tokens(session_id) == initial_keep + 1024
     print("[test] ConsolidationAdvisor break-even defer/trigger and rework penalty verified successfully.")
+
+
+@pytest.mark.asyncio
+async def test_09_models_endpoint_discovery():
+    """
+    Verifies GET /v1/models returns OpenAI-compatible list aliasing 'ephemeral-local'.
+    Required for OpenClaw, Hermes, and Pi model discovery.
+    """
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(f"{BASE_URL}/v1/models")
+        assert resp.status_code == 200, f"GET /v1/models failed: {resp.text}"
+        data = resp.json()
+        assert data.get("object") == "list"
+        models = data.get("data", [])
+        model_ids = [m.get("id") for m in models]
+        print(f"[test] /v1/models discovered: {model_ids}")
+        assert "ephemeral-local" in model_ids, f"Expected 'ephemeral-local' in {model_ids}"
+
+
+@pytest.mark.asyncio
+async def test_10_bearer_token_session_routing():
+    """
+    Verifies that requests passing Authorization: Bearer <key> are automatically
+    routed to isolated session 'bearer:<key>', preventing harness collision on 'default'.
+    """
+    token = f"test-harness-{uuid.uuid4().hex[:6]}"
+    expected_session_id = f"bearer:{token}"
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        headers = {"Authorization": f"Bearer {token}"}
+        resp = await client.post(
+            f"{BASE_URL}/v1/chat/completions",
+            headers=headers,
+            json={
+                "messages": [{"role": "user", "content": "Test routing via Bearer token."}],
+                "max_tokens": 5,
+            }
+        )
+        assert resp.status_code == 200
+
+        # Query session info for bearer:<token>
+        sess_resp = await client.get(f"{BASE_URL}/v1/sessions/{expected_session_id}")
+        assert sess_resp.status_code == 200, f"Expected session '{expected_session_id}' to exist"
+        sess_data = sess_resp.json()
+        assert sess_data["session_id"] == expected_session_id
+        assert sess_data["message_count"] >= 1
+        print(f"[test] Bearer session routing verified: '{expected_session_id}' isolated with {sess_data['message_count']} messages.")
+
+        # Cleanup
+        await client.delete(f"{BASE_URL}/v1/sessions/{expected_session_id}")
+
+
+@pytest.mark.asyncio
+async def test_11_agentic_tool_calls_and_atomic_eviction_integrity():
+    """
+    Verifies that tool-call sequences (assistant content=None + tool_calls, tool role + tool_call_id)
+    survive round-trips without crashing and maintain atomic group integrity during eviction/trimming.
+    """
+    session_id = f"tool_test_{uuid.uuid4().hex[:6]}"
+    tool_dialogue = [
+        {"role": "user", "content": "Calculate checksum for file A."},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_chk_99",
+                    "type": "function",
+                    "function": {
+                        "name": "compute_sha256",
+                        "arguments": '{"path": "fileA.bin"}'
+                    }
+                }
+            ]
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_chk_99",
+            "name": "compute_sha256",
+            "content": '{"sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}'
+        }
+    ]
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            f"{BASE_URL}/v1/chat/completions",
+            json={
+                "session_id": session_id,
+                "messages": tool_dialogue,
+                "max_tokens": 10,
+            }
+        )
+        assert resp.status_code == 200
+
+        # Query session messages
+        sess_resp = await client.get(f"{BASE_URL}/v1/sessions/{session_id}")
+        assert sess_resp.status_code == 200
+        stored_msgs = sess_resp.json()["messages"]
+
+        # Assert assistant message has tool_calls intact
+        asst_tool_msg = next((m for m in stored_msgs if m.get("role") == "assistant" and m.get("tool_calls")), None)
+        assert asst_tool_msg is not None, "Expected assistant tool_calls message to be stored with tool_calls"
+        assert asst_tool_msg["tool_calls"][0]["id"] == "call_chk_99"
+
+        # Assert tool message has tool_call_id and name intact
+        tool_result_msg = next((m for m in stored_msgs if m.get("role") == "tool"), None)
+        assert tool_result_msg is not None, "Expected tool role message to be stored intact"
+        assert tool_result_msg["tool_call_id"] == "call_chk_99"
+        assert tool_result_msg["name"] == "compute_sha256"
+
+        # Verify atomic grouping helper
+        from proxy import _group_atomic_turns
+        groups = _group_atomic_turns(tool_dialogue)
+        # Groups: [ [User], [Assistant(tool_calls), Tool(result)] ]
+        assert len(groups) == 2
+        assert len(groups[1]) == 2
+        assert groups[1][0]["role"] == "assistant"
+        assert groups[1][1]["role"] == "tool"
+        print("[test] Tool-call sequences and atomic eviction integrity verified successfully.")
+
+        # Cleanup
+        await client.delete(f"{BASE_URL}/v1/sessions/{session_id}")
+

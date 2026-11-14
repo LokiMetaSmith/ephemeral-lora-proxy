@@ -128,7 +128,9 @@ class EphemeralConsolidator:
             logger.warning("[Consolidator] Distillation produced no pairs; falling back to direct extractive turns")
             for msg in messages:
                 if msg.get("role") == "user":
-                    new_distilled_pairs.append({"q": msg.get("content", ""), "a": "Acknowledged and retained."})
+                    content = msg.get("content")
+                    if content:
+                        new_distilled_pairs.append({"q": str(content), "a": "Acknowledged and retained."})
 
         # Maintain rolling cumulative distilled facts for this session across multiple cycles
         sessions_dir = Path("/home/loki/ephemeral-lora-proxy/sessions")
@@ -200,7 +202,18 @@ class EphemeralConsolidator:
                 pass
 
     async def _self_distill(self, upstream_url: str, messages: List[Dict[str, Any]]) -> List[Dict[str, str]]:
-        dialogue_text = "\n".join([f"{m.get('role', 'user').capitalize()}: {m.get('content', '')}" for m in messages])
+        dialogue_lines = []
+        for m in messages:
+            role = m.get("role", "user").capitalize()
+            c = m.get("content")
+            if c:
+                dialogue_lines.append(f"{role}: {c}")
+            if "tool_calls" in m and m["tool_calls"]:
+                try:
+                    dialogue_lines.append(f"{role} ToolCalls: {json.dumps(m['tool_calls'])}")
+                except Exception:
+                    pass
+        dialogue_text = "\n".join(dialogue_lines)
         extraction_prompt = (
             "You are an expert knowledge distillation system. Extract 5 to 10 high-density, factual Q&A pairs "
             "and rule-enforcement examples from the following dialogue. Preserve all specific facts, user preferences, "

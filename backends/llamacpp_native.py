@@ -228,8 +228,18 @@ class LlamaCppNativeBackend(TrainerBackend):
                                 in_dim = p_a.shape[1]
                                 p_a.copy_(torch.randn_like(p_a) * (1.0 / np.sqrt(in_dim)))
 
+                        # Ensure input dimension matches lora_a projection input dim
+                        in_dim = p_a.shape[1]
+                        if x.shape[-1] != in_dim:
+                            if x.shape[-1] < in_dim:
+                                x_proj = F.pad(x, (0, in_dim - x.shape[-1]))
+                            else:
+                                x_proj = x[:, :in_dim]
+                        else:
+                            x_proj = x
+
                         # y_lora: [seq_len, out_dim]
-                        y_lora = (x @ p_a.T) @ p_b.T * scaling
+                        y_lora = (x_proj @ p_a.T) @ p_b.T * scaling
                         if output_weight is not None:
                             if p_b.shape[0] == output_weight.shape[1]:
                                 logits = y_lora @ output_weight.T

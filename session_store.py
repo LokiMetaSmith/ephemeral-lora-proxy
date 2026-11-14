@@ -1,6 +1,7 @@
 import sqlite3
 import threading
 import time
+import json
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
 
@@ -44,12 +45,34 @@ class SessionStore:
                     session_id TEXT,
                     role TEXT,
                     content TEXT,
+                    extra_json TEXT,
                     is_consolidated INTEGER DEFAULT 0,
                     created_at REAL,
                     FOREIGN KEY(session_id) REFERENCES sessions(session_id)
                 )
                 """)
+                try:
+                    conn.execute("ALTER TABLE messages ADD COLUMN extra_json TEXT")
+                except sqlite3.OperationalError:
+                    pass
                 conn.commit()
+
+    @staticmethod
+    def _row_to_msg(r: sqlite3.Row) -> Dict[str, Any]:
+        msg = {
+            "id": r["id"],
+            "role": r["role"],
+            "content": r["content"],
+            "is_consolidated": r["is_consolidated"],
+        }
+        if "extra_json" in r.keys() and r["extra_json"]:
+            try:
+                extra = json.loads(r["extra_json"])
+                if isinstance(extra, dict):
+                    msg.update(extra)
+            except Exception:
+                pass
+        return msg
 
     def get_or_create_session(self, session_id: str) -> SessionState:
         with self._lock:
@@ -79,14 +102,23 @@ class SessionStore:
                 self._memory_sessions[session_id] = state
                 return state
 
-    def add_message(self, session_id: str, role: str, content: str) -> int:
+    def add_message(
+        self,
+        session_id: str,
+        role: str,
+        content: Optional[Any] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> int:
         self.get_or_create_session(session_id)
         now = time.time()
+        extra_str = json.dumps(extra) if extra else None
+        # In sqlite text content column, store string or None
+        text_content = content if isinstance(content, str) else (None if content is None else json.dumps(content))
         with self._lock:
             with self._get_conn() as conn:
                 cur = conn.execute(
-                    "INSERT INTO messages (session_id, role, content, is_consolidated, created_at) VALUES (?, ?, ?, 0, ?)",
-                    (session_id, role, content, now)
+                    "INSERT INTO messages (session_id, role, content, extra_json, is_consolidated, created_at) VALUES (?, ?, ?, ?, 0, ?)",
+                    (session_id, role, text_content, extra_str, now)
                 )
                 msg_id = cur.lastrowid
                 conn.execute("UPDATE sessions SET updated_at = ? WHERE session_id = ?", (now, session_id))
@@ -104,7 +136,7 @@ class SessionStore:
         with self._lock:
             with self._get_conn() as conn:
                 cur = conn.execute(
-                    "SELECT id, role, content, is_consolidated FROM messages WHERE session_id = ? ORDER BY id ASC",
+                    "SELECT id, role, content, extra_json, is_consolidated FROM messages WHERE session_id = ? ORDER BY id ASC",
                     (session_id,)
                 )
                 rows = cur.fetchall()
@@ -115,12 +147,12 @@ class SessionStore:
                 # Keep system prompt if first message
                 first = rows[0]
                 if first["role"] == "system":
-                    result.append({"id": first["id"], "role": first["role"], "content": first["content"]})
+                    result.append(self._row_to_msg(first))
                     rows = rows[1:]
 
                 for r in rows:
                     if r["is_consolidated"] != 1:
-                        result.append({"id": r["id"], "role": r["role"], "content": r["content"], "is_consolidated": r["is_consolidated"]})
+                        result.append(self._row_to_msg(r))
                 return result
 
     def get_unconsolidated_candidates(self, session_id: str) -> List[Dict[str, Any]]:
@@ -128,10 +160,10 @@ class SessionStore:
         with self._lock:
             with self._get_conn() as conn:
                 cur = conn.execute(
-                    "SELECT id, role, content FROM messages WHERE session_id = ? AND is_consolidated = 0 AND role != 'system' ORDER BY id ASC",
+                    "SELECT id, role, content, extra_json, is_consolidated FROM messages WHERE session_id = ? AND is_consolidated = 0 AND role != 'system' ORDER BY id ASC",
                     (session_id,)
                 )
-                return [dict(r) for r in cur.fetchall()]
+                return [self._row_to_msg(r) for r in cur.fetchall()]
 
     def mark_messages_pending(self, session_id: str, msg_ids: List[int]):
         """Marks messages as pending consolidation (is_consolidated = 2) to prevent re-enqueue."""
@@ -163,10 +195,10 @@ class SessionStore:
         with self._lock:
             with self._get_conn() as conn:
                 cur = conn.execute(
-                    "SELECT id, role, content, is_consolidated FROM messages WHERE session_id = ? ORDER BY id ASC",
+                    "SELECT id, role, content, extra_json, is_consolidated FROM messages WHERE session_id = ? ORDER BY id ASC",
                     (session_id,)
                 )
-                return [dict(r) for r in cur.fetchall()]
+                return [self._row_to_msg(r) for r in cur.fetchall()]
 
     def mark_messages_consolidated(self, session_id: str, msg_ids: List[int]):
         if not msg_ids:
