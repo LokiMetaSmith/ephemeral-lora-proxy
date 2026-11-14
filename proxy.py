@@ -446,16 +446,12 @@ async def chat_completions(request: Request):
     session_keep_tokens = body.get("keep_recent_tokens") or advisor.get_session_keep_tokens(session_id)
     slot_safety_limit = session_keep_tokens
 
-    trimmed_payload_msgs = []
-    has_system = active_msgs and active_msgs[0].get("role") == "system"
-    if has_system:
-        system_msg = active_msgs[0]
-        dialogue = active_msgs[1:]
-    else:
-        system_msg = None
-        dialogue = active_msgs
+    # 1. Separate system messages from dialogue
+    system_msgs = [m for m in active_msgs if m.get("role") == "system"]
+    system_msg = system_msgs[-1] if system_msgs else None
+    dialogue = [m for m in active_msgs if m.get("role") != "system"]
 
-    # Group dialogue into atomic units so tool calls and results are never split
+    # 2. Group dialogue into atomic units so tool calls and results are never split
     dialogue_groups = _group_atomic_turns(dialogue)
     curr_tokens = 0
     recent_kept_groups = []
@@ -468,33 +464,29 @@ async def chat_completions(request: Request):
             break
 
     recent_kept_groups.reverse()
-    if system_msg:
-        trimmed_payload_msgs.append(system_msg)
+    dialogue_msgs = []
     for grp in recent_kept_groups:
-        trimmed_payload_msgs.extend(grp)
+        dialogue_msgs.extend(grp)
 
-    # Double check total token count with upstream tokenize to guarantee context limit
+    # Invariant: Dialogue MUST start with a role: "user" turn (never orphan assistant or tool)
+    while dialogue_msgs and dialogue_msgs[0].get("role") != "user":
+        dialogue_msgs.pop(0)
+    if not dialogue_msgs and dialogue:
+        latest_user = next((m for m in reversed(dialogue) if m.get("role") == "user"), None)
+        if latest_user:
+            dialogue_msgs = [latest_user]
+
+    trimmed_payload_msgs = ([system_msg] if system_msg else []) + dialogue_msgs
+
+    # 3. Double check total token count against max_slot_tokens (hard ceiling)
     max_slot_tokens = int(config.get("thresholds", {}).get("hard_max_ctx_tokens", 65536))
     total_trimmed_tokens = await _tokenize_messages(trimmed_payload_msgs, upstream_url)
-    while total_trimmed_tokens > max_slot_tokens and len(trimmed_payload_msgs) > 2:
-        if has_system and len(trimmed_payload_msgs) > 1:
-            dropped = trimmed_payload_msgs[1]
-            if dropped.get("role") == "assistant" and dropped.get("tool_calls"):
-                idx_drop = 2
-                while idx_drop < len(trimmed_payload_msgs) and trimmed_payload_msgs[idx_drop].get("role") == "tool":
-                    idx_drop += 1
-                trimmed_payload_msgs = [trimmed_payload_msgs[0]] + trimmed_payload_msgs[idx_drop:]
-            else:
-                trimmed_payload_msgs = [trimmed_payload_msgs[0]] + trimmed_payload_msgs[2:]
-        else:
-            dropped = trimmed_payload_msgs[0]
-            if dropped.get("role") == "assistant" and dropped.get("tool_calls"):
-                idx_drop = 1
-                while idx_drop < len(trimmed_payload_msgs) and trimmed_payload_msgs[idx_drop].get("role") == "tool":
-                    idx_drop += 1
-                trimmed_payload_msgs = trimmed_payload_msgs[idx_drop:]
-            else:
-                trimmed_payload_msgs = trimmed_payload_msgs[1:]
+    while total_trimmed_tokens > max_slot_tokens and len(dialogue_msgs) > 1:
+        # Drop oldest dialogue turn group and re-align to next user turn
+        dialogue_msgs.pop(0)
+        while dialogue_msgs and dialogue_msgs[0].get("role") != "user":
+            dialogue_msgs.pop(0)
+        trimmed_payload_msgs = ([system_msg] if system_msg else []) + dialogue_msgs
         total_trimmed_tokens = await _tokenize_messages(trimmed_payload_msgs, upstream_url)
 
     # 4. Inject LoRA configuration dynamically into upstream request, preserving tool fields
@@ -513,13 +505,30 @@ async def chat_completions(request: Request):
         if "name" in m and m["name"]:
             f_msg["name"] = m["name"]
 
+        # Invariant: A tool message can only follow an assistant message with tool_calls
+        if role == "tool":
+            if not f_messages or f_messages[-1]["role"] != "assistant" or not f_messages[-1].get("tool_calls"):
+                continue  # Skip orphan tool message
+
         # Merge adjacent user messages to satisfy Jinja template alternating requirements
         if f_messages and f_messages[-1]["role"] == "user" and role == "user":
             prev_c = _normalize_content_for_comparison(f_messages[-1].get("content"))
             curr_c = _normalize_content_for_comparison(f_msg.get("content"))
             f_messages[-1]["content"] = f"{prev_c}\n\n{curr_c}".strip()
+        # Merge adjacent assistant messages (without tool_calls)
+        elif f_messages and f_messages[-1]["role"] == "assistant" and role == "assistant" and not f_messages[-1].get("tool_calls") and not f_msg.get("tool_calls"):
+            prev_c = _normalize_content_for_comparison(f_messages[-1].get("content"))
+            curr_c = _normalize_content_for_comparison(f_msg.get("content"))
+            f_messages[-1]["content"] = f"{prev_c}\n\n{curr_c}".strip()
         else:
             f_messages.append(f_msg)
+
+    # Final sanity check: dialogue MUST start with a user message
+    has_sys = bool(f_messages and f_messages[0]["role"] == "system")
+    dialogue_start = 1 if has_sys else 0
+    while len(f_messages) > dialogue_start and f_messages[dialogue_start]["role"] != "user":
+        f_messages.pop(dialogue_start)
+
     forward_body["messages"] = f_messages
     scale = session_state.active_lora_scale
     forward_body["lora"] = [{"id": 0, "scale": scale}]
