@@ -8,7 +8,7 @@ upstream:
   timeout_seconds: 120.0
 
 model:
-  path: "/home/loki/Models/mistralai_Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf"
+  path: "/home/loki/Models/mistralai_Devstral-Small-2-24B-Instruct-2512-Q8_0.gguf"
   hf_weights_path: ""
 
 lora:
